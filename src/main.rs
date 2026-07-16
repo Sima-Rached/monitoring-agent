@@ -5,6 +5,36 @@ use bollard::Docker;
 use bollard::container::StatsOptions;
 use futures_util::stream::StreamExt;
 use dashmap::DashMap;
+use influxdb2::Client;
+use influxdb2_derive::WriteDataPoint;
+use futures::stream;
+use chrono::Utc;
+
+
+#[derive(Default, WriteDataPoint)]
+#[measurement = "broker_metrics"]
+struct BrokerMetricsPoint {
+    #[influxdb(tag)]
+    broker_id: String,
+    #[influxdb(tag)]
+    host: String,
+    #[influxdb(field)]
+    clients_connected: i64,
+    #[influxdb(field)]
+    messages_sent: i64,
+    #[influxdb(field)]
+    messages_received: i64,
+    #[influxdb(field)]
+    bytes_sent: i64,
+    #[influxdb(field)]
+    bytes_received: i64,
+    #[influxdb(field)]
+    cpu_percent: f64,
+    #[influxdb(field)]
+    mem_usage_mb: f64,
+    #[influxdb(timestamp)]
+    time: i64,
+}
 
 #[derive(Debug, Default, Clone)]
 struct BrokerMetrics {
@@ -136,6 +166,40 @@ async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docke
     }
 }
 
+async fn spawn_influx_writer(state: SharedState, host_label: String) {
+    let client = Client::new("http://localhost:8086", "monitoring-org", "dev-token-please-change");
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let points: Vec<BrokerMetricsPoint> = state
+            .iter()
+            .map(|entry| {
+                let (broker_id, m) = (entry.key().clone(), entry.value());
+                BrokerMetricsPoint {
+                    broker_id,
+                    host: host_label.clone(),
+                    clients_connected: m.clients_connected.unwrap_or(0) as i64,
+                    messages_sent: m.messages_sent.unwrap_or(0) as i64,
+                    messages_received: m.messages_received.unwrap_or(0) as i64,
+                    bytes_sent: m.bytes_sent.unwrap_or(0) as i64,
+                    bytes_received: m.bytes_received.unwrap_or(0) as i64,
+                    cpu_percent: m.cpu_percent.unwrap_or(0.0),
+                    mem_usage_mb: m.mem_usage_mb.unwrap_or(0.0),
+                    time: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                }
+            })
+            .collect();
+
+        let count = points.len();
+        if let Err(e) = client.write("broker-metrics", stream::iter(points)).await {
+            eprintln!("InfluxDB write error: {:?}", e);
+        } else {
+            println!("wrote {} broker metric points to InfluxDB", count);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // TODO(B1-05): load this list from TOML instead of hardcoding
@@ -158,6 +222,9 @@ async fn main() {
     let docker = Docker::connect_with_local_defaults().expect("failed to connect to Docker socket");
 
     println!("agent starting up, spawning tasks for {} broker(s)", brokers.len());
+
+    let state_clone = state.clone();
+tokio::spawn(spawn_influx_writer(state_clone, "sima-ThinkPad-E16-Gen-1".to_string()));
 
     let mut handles = Vec::new();
 

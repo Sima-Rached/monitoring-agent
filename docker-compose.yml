@@ -1,0 +1,38 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ~/mosquitto/config:/mosquitto/config
+      - ~/mosquitto/data:/mosquitto/data
+      - ~/mosquitto/log:/mosquitto/log
+
+  mosquitto2:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto2
+    ports:
+      - "1884:1883"
+    volumes:
+      - ~/mosquitto/config2:/mosquitto/config
+      - ~/mosquitto/data2:/mosquitto/data
+      - ~/mosquitto/log2:/mosquitto/log
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=adminpassword123
+      - DOCKER_INFLUXDB_INIT_ORG=monitoring-org
+      - DOCKER_INFLUXDB_INIT_BUCKET=broker-metrics
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=dev-token-please-change
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+
+volumes:
+  influxdb-data:

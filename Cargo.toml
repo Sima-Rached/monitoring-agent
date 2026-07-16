@@ -14,3 +14,6 @@ toml = "0.8"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 futures-util = "0.3"
 dashmap = "6"
+influxdb2-derive = "0.1"
+futures = "0.3"
+chrono = "0.4.45"
