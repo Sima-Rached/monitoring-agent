@@ -1,0 +1,28 @@
+[influxdb]
+url = "http://localhost:8086"
+org = "monitoring-org"
+bucket = "broker-metrics"
+token = "dev-token-please-change"
+
+[intervals]
+mqtt_scrape_secs = 2
+docker_scrape_secs = 10
+influx_write_secs = 5
+
+[[brokers]]
+id = "broker-1"
+mqtt_host = "localhost"
+mqtt_port = 1883
+container_name = "mosquitto"
+
+[[brokers]]
+id = "broker-2"
+mqtt_host = "localhost"
+mqtt_port = 1884
+container_name = "mosquitto2"
+
+[[alert_rules]]
+metric = "cpu_percent"
+operator = ">"
+threshold = 80.0
+cooldown_secs = 60

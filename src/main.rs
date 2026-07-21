@@ -9,7 +9,8 @@ use influxdb2::Client;
 use influxdb2_derive::WriteDataPoint;
 use futures::stream;
 use chrono::Utc;
-
+mod config;
+use config::{Config, BrokerConfig};
 
 #[derive(Default, WriteDataPoint)]
 #[measurement = "broker_metrics"]
@@ -49,24 +50,15 @@ struct BrokerMetrics {
     net_tx_bytes: Option<u64>,
 }
 
-// TODO(B1-05): this whole struct + the hardcoded list below moves into TOML config
-#[derive(Debug, Clone)]
-struct BrokerConfig {
-    id: String,
-    host: String,
-    port: u16,
-    container_name: String,
-}
-
 // Shared state, keyed by broker_id. Every task below writes into this;
 // nothing reads it yet (that's B1-06's GET /metrics endpoint).
 type SharedState = Arc<DashMap<String, BrokerMetrics>>;
 
-async fn run_mqtt_task(broker: BrokerConfig, state: SharedState) {
+async fn run_mqtt_task(broker: BrokerConfig, state: SharedState, scrape_interval_secs: u64) {
     let mut mqttoptions = MqttOptions::new(
         format!("cloud-monitoring-agent-{}", broker.id),
-        broker.host.clone(),
-        broker.port,
+        broker.mqtt_host.clone(),
+        broker.mqtt_port,
     );
     mqttoptions.set_keep_alive(Duration::from_secs(30));
 
@@ -77,7 +69,7 @@ async fn run_mqtt_task(broker: BrokerConfig, state: SharedState) {
         return;
     }
 
-    println!("[{}] agent subscribed to $SYS/# on {}:{}", broker.id, broker.host, broker.port);
+    println!("[{}] agent subscribed to $SYS/# on {}:{}", broker.id, broker.mqtt_host, broker.mqtt_port);
 
     loop {
         match eventloop.poll().await {
@@ -114,13 +106,13 @@ async fn run_mqtt_task(broker: BrokerConfig, state: SharedState) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[{}] MQTT event loop error: {:?}", broker.id, e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(scrape_interval_secs)).await;
             }
         }
     }
 }
 
-async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docker) {
+async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docker, scrape_interval_secs: u64) {
     loop {
         let mut stream = docker.stats(
             &broker.container_name,
@@ -162,15 +154,15 @@ async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docke
             );
         }
 
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(scrape_interval_secs)).await;
     }
 }
 
-async fn spawn_influx_writer(state: SharedState, host_label: String) {
-    let client = Client::new("http://localhost:8086", "monitoring-org", "dev-token-please-change");
+async fn spawn_influx_writer(state: SharedState, influx_cfg: config::InfluxConfig, write_interval_secs: u64) {
+    let client = Client::new(influx_cfg.url, influx_cfg.org, influx_cfg.token);
 
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(write_interval_secs)).await;
 
         let points: Vec<BrokerMetricsPoint> = state
             .iter()
@@ -178,7 +170,7 @@ async fn spawn_influx_writer(state: SharedState, host_label: String) {
                 let (broker_id, m) = (entry.key().clone(), entry.value());
                 BrokerMetricsPoint {
                     broker_id,
-                    host: host_label.clone(),
+                    host: "sima-ThinkPad-E16-Gen-1".to_string().clone(),
                     clients_connected: m.clients_connected.unwrap_or(0) as i64,
                     messages_sent: m.messages_sent.unwrap_or(0) as i64,
                     messages_received: m.messages_received.unwrap_or(0) as i64,
@@ -192,7 +184,7 @@ async fn spawn_influx_writer(state: SharedState, host_label: String) {
             .collect();
 
         let count = points.len();
-        if let Err(e) = client.write("broker-metrics", stream::iter(points)).await {
+        if let Err(e) = client.write(&influx_cfg.bucket, stream::iter(points)).await {
             eprintln!("InfluxDB write error: {:?}", e);
         } else {
             println!("wrote {} broker metric points to InfluxDB", count);
@@ -202,55 +194,44 @@ async fn spawn_influx_writer(state: SharedState, host_label: String) {
 
 #[tokio::main]
 async fn main() {
-    // TODO(B1-05): load this list from TOML instead of hardcoding
-    let brokers = vec![
-        BrokerConfig {
-            id: "broker-1".to_string(),
-            host: "localhost".to_string(),
-            port: 1883,
-            container_name: "mosquitto".to_string(),
-        },
-        BrokerConfig {
-            id: "broker-2".to_string(),
-            host: "localhost".to_string(),
-            port: 1884,
-            container_name: "mosquitto2".to_string(),
-        },
-    ];
+    let config = match Config::load("config.toml") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Config error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let state: SharedState = Arc::new(DashMap::new());
-    let docker = Docker::connect_with_local_defaults().expect("failed to connect to Docker socket");
+    let docker = Docker::connect_with_local_defaults().expect("failed to connect to Docker");
 
-    println!("agent starting up, spawning tasks for {} broker(s)", brokers.len());
+    let mut handles = vec![];
 
-    let state_clone = state.clone();
-tokio::spawn(spawn_influx_writer(state_clone, "sima-ThinkPad-E16-Gen-1".to_string()));
-
-    let mut handles = Vec::new();
-
-    for broker in brokers {
-        // One MQTT task + one Docker task per broker, each with its own
-        // clone of the shared state and its own clone of the Docker client
-        // (bollard's Docker handle is cheap to clone, backed by a shared connection).
-        let mqtt_state = Arc::clone(&state);
-        let mqtt_broker = broker.clone();
+    for broker in &config.brokers {
+        let state_clone = state.clone();
+        let broker_clone = broker.clone();
+        let mqtt_interval = config.intervals.mqtt_scrape_secs;
         handles.push(tokio::spawn(async move {
-            run_mqtt_task(mqtt_broker, mqtt_state).await;
+            run_mqtt_task(broker_clone, state_clone, mqtt_interval).await;
         }));
 
-        let docker_state = Arc::clone(&state);
+        let state_clone = state.clone();
+        let broker_clone = broker.clone();
         let docker_clone = docker.clone();
-        let docker_broker = broker.clone();
+        let docker_interval = config.intervals.docker_scrape_secs;
         handles.push(tokio::spawn(async move {
-            run_docker_task(docker_broker, docker_state, docker_clone).await;
+            run_docker_task(broker_clone, state_clone, docker_clone, docker_interval).await;
         }));
     }
 
-    // Keep main alive; if any task panics, propagate that as a loud failure
-    // rather than silently running with fewer brokers than expected.
+    let state_clone = state.clone();
+    let influx_cfg = config.influxdb;
+    let influx_interval = config.intervals.influx_write_secs;
+    handles.push(tokio::spawn(async move {
+        spawn_influx_writer(state_clone, influx_cfg, influx_interval).await;
+    }));
+
     for handle in handles {
-        if let Err(e) = handle.await {
-            eprintln!("a broker task panicked: {:?}", e);
-        }
+        let _ = handle.await;
     }
 }
