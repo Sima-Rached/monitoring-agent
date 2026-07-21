@@ -10,7 +10,9 @@ use influxdb2_derive::WriteDataPoint;
 use futures::stream;
 use chrono::Utc;
 mod config;
+mod http;                                                   // ← B1-06
 use config::{Config, BrokerConfig};
+use http::{AppState, build_router};                        // ← B1-06
 
 #[derive(Default, WriteDataPoint)]
 #[measurement = "broker_metrics"]
@@ -38,21 +40,20 @@ struct BrokerMetricsPoint {
 }
 
 #[derive(Debug, Default, Clone)]
-struct BrokerMetrics {
-    clients_connected: Option<u64>,
-    messages_sent: Option<u64>,
-    messages_received: Option<u64>,
-    bytes_sent: Option<u64>,
-    bytes_received: Option<u64>,
-    cpu_percent: Option<f64>,
-    mem_usage_mb: Option<f64>,
-    net_rx_bytes: Option<u64>,
-    net_tx_bytes: Option<u64>,
+pub struct BrokerMetrics {                                 // ← B1-06: made `pub` so http.rs can read it
+    pub clients_connected: Option<u64>,                   // ← B1-06: fields made `pub`
+    pub messages_sent: Option<u64>,
+    pub messages_received: Option<u64>,
+    pub bytes_sent: Option<u64>,
+    pub bytes_received: Option<u64>,
+    pub cpu_percent: Option<f64>,
+    pub mem_usage_mb: Option<f64>,
+    pub net_rx_bytes: Option<u64>,
+    pub net_tx_bytes: Option<u64>,
+    pub last_updated_secs: Option<i64>,                   // ← B1-06: staleness timestamp
 }
 
-// Shared state, keyed by broker_id. Every task below writes into this;
-// nothing reads it yet (that's B1-06's GET /metrics endpoint).
-type SharedState = Arc<DashMap<String, BrokerMetrics>>;
+pub type SharedState = Arc<DashMap<String, BrokerMetrics>>;  // ← B1-06: made `pub`
 
 async fn run_mqtt_task(broker: BrokerConfig, state: SharedState, scrape_interval_secs: u64) {
     let mut mqttoptions = MqttOptions::new(
@@ -77,9 +78,6 @@ async fn run_mqtt_task(broker: BrokerConfig, state: SharedState, scrape_interval
                 let topic = publish.topic.as_str();
                 let payload = String::from_utf8_lossy(&publish.payload);
 
-                // Grab-or-create this broker's entry, mutate just the touched field.
-                // DashMap gives us per-key locking, so this task never blocks
-                // the other broker's task even under contention.
                 let mut entry = state.entry(broker.id.clone()).or_default();
 
                 match topic {
@@ -100,6 +98,8 @@ async fn run_mqtt_task(broker: BrokerConfig, state: SharedState, scrape_interval
                     }
                     _ => {}
                 }
+
+                entry.last_updated_secs = Some(Utc::now().timestamp()); // ← B1-06
 
                 println!("[{}] {:?}", broker.id, *entry);
             }
@@ -147,6 +147,7 @@ async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docke
             entry.mem_usage_mb = Some(mem_usage_mb);
             entry.net_rx_bytes = Some(rx_bytes);
             entry.net_tx_bytes = Some(tx_bytes);
+            entry.last_updated_secs = Some(Utc::now().timestamp()); // ← B1-06
 
             println!(
                 "[{}] container stats -> cpu: {:.2}%, mem: {:.2} MB, net_rx: {}, net_tx: {}",
@@ -159,6 +160,7 @@ async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docke
 }
 
 async fn spawn_influx_writer(state: SharedState, influx_cfg: config::InfluxConfig, write_interval_secs: u64) {
+    // unchanged — no B1-06 edits needed here
     let client = Client::new(influx_cfg.url, influx_cfg.org, influx_cfg.token);
 
     loop {
@@ -170,7 +172,7 @@ async fn spawn_influx_writer(state: SharedState, influx_cfg: config::InfluxConfi
                 let (broker_id, m) = (entry.key().clone(), entry.value());
                 BrokerMetricsPoint {
                     broker_id,
-                    host: "sima-ThinkPad-E16-Gen-1".to_string().clone(),
+                    host: "sima-ThinkPad-E16-Gen-1".to_string(),
                     clients_connected: m.clients_connected.unwrap_or(0) as i64,
                     messages_sent: m.messages_sent.unwrap_or(0) as i64,
                     messages_received: m.messages_received.unwrap_or(0) as i64,
@@ -229,6 +231,22 @@ async fn main() {
     let influx_interval = config.intervals.influx_write_secs;
     handles.push(tokio::spawn(async move {
         spawn_influx_writer(state_clone, influx_cfg, influx_interval).await;
+    }));
+
+    // ── B1-06: HTTP server task ───────────────────────────────────────────────
+    let app_state = Arc::new(AppState {
+        metrics: state.clone(),
+        stale_threshold_secs: (config.intervals.mqtt_scrape_secs * 2) as i64,
+    });
+    let router = build_router(app_state);
+    handles.push(tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+            .await
+            .expect("failed to bind HTTP server to port 3000");
+        println!("HTTP server listening on http://0.0.0.0:3000");
+        axum::serve(listener, router)
+            .await
+            .expect("HTTP server error");
     }));
 
     for handle in handles {
