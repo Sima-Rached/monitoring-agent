@@ -22,6 +22,10 @@ pub struct BrokerMetricsResponse {
     pub last_updated_secs: Option<i64>,
     // True when the most recent data is older than 2 × mqtt_scrape_secs.
     pub stale: bool,
+    pub mqtt_online: bool,                                 // ← B1-07
+    pub docker_online: bool,                              // ← B1-07
+    pub online: bool,                                     // ← B1-07: true only if both healthy
+
 }
 
 #[derive(Serialize)]
@@ -71,6 +75,9 @@ pub async fn get_metrics(
                 net_tx_bytes: m.net_tx_bytes,
                 last_updated_secs: m.last_updated_secs,
                 stale,
+                mqtt_online: m.mqtt_online,
+                docker_online: m.docker_online,
+                online: m.mqtt_online && m.docker_online,
             }
         })
         .collect();

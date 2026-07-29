@@ -51,66 +51,83 @@ pub struct BrokerMetrics {                                 // ← B1-06: made `p
     pub net_rx_bytes: Option<u64>,
     pub net_tx_bytes: Option<u64>,
     pub last_updated_secs: Option<i64>,                   // ← B1-06: staleness timestamp
+    pub mqtt_online: bool,                                 // ← B1-07
+    pub docker_online: bool,                              // ← B1-07
+    pub online: bool,
 }
 
 pub type SharedState = Arc<DashMap<String, BrokerMetrics>>;  // ← B1-06: made `pub`
 
 async fn run_mqtt_task(broker: BrokerConfig, state: SharedState, scrape_interval_secs: u64) {
-    let mut mqttoptions = MqttOptions::new(
-        format!("cloud-monitoring-agent-{}", broker.id),
-        broker.mqtt_host.clone(),
-        broker.mqtt_port,
-    );
-    mqttoptions.set_keep_alive(Duration::from_secs(30));
-
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-
-    if let Err(e) = client.subscribe("$SYS/#", QoS::AtMostOnce).await {
-        eprintln!("[{}] failed to subscribe to $SYS/#: {:?}", broker.id, e);
-        return;
-    }
-
-    println!("[{}] agent subscribed to $SYS/# on {}:{}", broker.id, broker.mqtt_host, broker.mqtt_port);
-
     loop {
-        match eventloop.poll().await {
-            Ok(Event::Incoming(Packet::Publish(publish))) => {
-                let topic = publish.topic.as_str();
-                let payload = String::from_utf8_lossy(&publish.payload);
+        // Build a fresh client on every connection attempt.
+        // The old client/eventloop pair is dropped when we fall through to
+        // the sleep at the bottom, so there is no resource leak.
+        let mut mqttoptions = MqttOptions::new(
+            format!("cloud-monitoring-agent-{}", broker.id),
+            broker.mqtt_host.clone(),
+            broker.mqtt_port,
+        );
+        mqttoptions.set_keep_alive(Duration::from_secs(30));
 
-                let mut entry = state.entry(broker.id.clone()).or_default();
+        let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
 
-                match topic {
-                    "$SYS/broker/clients/connected" => {
-                        entry.clients_connected = payload.trim().parse().ok();
+        if let Err(e) = client.subscribe("$SYS/#", QoS::AtMostOnce).await {
+            eprintln!("[{}] failed to subscribe to $SYS/#: {:?}", broker.id, e);
+            // Mark offline before sleeping — the subscribe itself failed,
+            // so we never had a working connection this attempt.       // ← B1-07
+            state.entry(broker.id.clone()).or_default().mqtt_online = false; // ← B1-07
+            tokio::time::sleep(Duration::from_secs(scrape_interval_secs)).await;
+            continue; // restart the outer loop → rebuild client
+        }
+
+        println!("[{}] agent subscribed to $SYS/# on {}:{}", broker.id, broker.mqtt_host, broker.mqtt_port);
+        // Subscription confirmed — broker is reachable.               // ← B1-07
+        state.entry(broker.id.clone()).or_default().mqtt_online = true; // ← B1-07
+
+        // Inner poll loop — runs until the connection breaks.
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::Publish(publish))) => {
+                    let topic = publish.topic.as_str();
+                    let payload = String::from_utf8_lossy(&publish.payload);
+
+                    let mut entry = state.entry(broker.id.clone()).or_default();
+
+                    match topic {
+                        "$SYS/broker/clients/connected" => {
+                            entry.clients_connected = payload.trim().parse().ok();
+                        }
+                        "$SYS/broker/messages/sent" => {
+                            entry.messages_sent = payload.trim().parse().ok();
+                        }
+                        "$SYS/broker/messages/received" => {
+                            entry.messages_received = payload.trim().parse().ok();
+                        }
+                        "$SYS/broker/bytes/sent" => {
+                            entry.bytes_sent = payload.trim().parse().ok();
+                        }
+                        "$SYS/broker/bytes/received" => {
+                            entry.bytes_received = payload.trim().parse().ok();
+                        }
+                        _ => {}
                     }
-                    "$SYS/broker/messages/sent" => {
-                        entry.messages_sent = payload.trim().parse().ok();
-                    }
-                    "$SYS/broker/messages/received" => {
-                        entry.messages_received = payload.trim().parse().ok();
-                    }
-                    "$SYS/broker/bytes/sent" => {
-                        entry.bytes_sent = payload.trim().parse().ok();
-                    }
-                    "$SYS/broker/bytes/received" => {
-                        entry.bytes_received = payload.trim().parse().ok();
-                    }
-                    _ => {}
+
+                    entry.last_updated_secs = Some(Utc::now().timestamp());
+                    println!("[{}] {:?}", broker.id, *entry);
                 }
-
-                entry.last_updated_secs = Some(Utc::now().timestamp()); // ← B1-06
-
-                println!("[{}] {:?}", broker.id, *entry);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("[{}] MQTT event loop error: {:?}", broker.id, e);
-                tokio::time::sleep(Duration::from_secs(scrape_interval_secs)).await;
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[{}] MQTT connection lost: {:?}", broker.id, e);
+                    // Mark offline immediately — within this scrape cycle. // ← B1-07
+                    state.entry(broker.id.clone()).or_default().mqtt_online = false; // ← B1-07
+                    tokio::time::sleep(Duration::from_secs(scrape_interval_secs)).await;
+                    break; // exit inner loop → outer loop rebuilds client
+                }
             }
         }
     }
-}
+} 
 
 async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docker, scrape_interval_secs: u64) {
     loop {
@@ -119,45 +136,57 @@ async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docke
             Some(StatsOptions { stream: false, ..Default::default() }),
         );
 
-        if let Some(Ok(stats)) = stream.next().await {
-            let cpu_delta = stats.cpu_stats.cpu_usage.total_usage as f64
-                - stats.precpu_stats.cpu_usage.total_usage as f64;
-            let system_delta = stats.cpu_stats.system_cpu_usage.unwrap_or(0) as f64
-                - stats.precpu_stats.system_cpu_usage.unwrap_or(0) as f64;
-            let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
+        match stream.next().await {                                    // ← B1-07: was `if let Some(Ok(...))`
+            Some(Ok(stats)) => {
+                let cpu_delta = stats.cpu_stats.cpu_usage.total_usage as f64
+                    - stats.precpu_stats.cpu_usage.total_usage as f64;
+                let system_delta = stats.cpu_stats.system_cpu_usage.unwrap_or(0) as f64
+                    - stats.precpu_stats.system_cpu_usage.unwrap_or(0) as f64;
+                let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
 
-            let cpu_percent = if system_delta > 0.0 && cpu_delta > 0.0 {
-                (cpu_delta / system_delta) * num_cpus * 100.0
-            } else {
-                0.0
-            };
+                let cpu_percent = if system_delta > 0.0 && cpu_delta > 0.0 {
+                    (cpu_delta / system_delta) * num_cpus * 100.0
+                } else {
+                    0.0
+                };
 
-            let mem_usage_mb = stats.memory_stats.usage.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+                let mem_usage_mb = stats.memory_stats.usage.unwrap_or(0) as f64 / (1024.0 * 1024.0);
 
-            let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
-            if let Some(networks) = &stats.networks {
-                for (_iface, net) in networks {
-                    rx_bytes += net.rx_bytes;
-                    tx_bytes += net.tx_bytes;
+                let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
+                if let Some(networks) = &stats.networks {
+                    for (_iface, net) in networks {
+                        rx_bytes += net.rx_bytes;
+                        tx_bytes += net.tx_bytes;
+                    }
                 }
+
+                let mut entry = state.entry(broker.id.clone()).or_default();
+                entry.cpu_percent = Some(cpu_percent);
+                entry.mem_usage_mb = Some(mem_usage_mb);
+                entry.net_rx_bytes = Some(rx_bytes);
+                entry.net_tx_bytes = Some(tx_bytes);
+                entry.last_updated_secs = Some(Utc::now().timestamp());
+                entry.docker_online = true;                            // ← B1-07
+
+                println!(
+                    "[{}] container stats -> cpu: {:.2}%, mem: {:.2} MB, net_rx: {}, net_tx: {}",
+                    broker.id, cpu_percent, mem_usage_mb, rx_bytes, tx_bytes
+                );
             }
-
-            let mut entry = state.entry(broker.id.clone()).or_default();
-            entry.cpu_percent = Some(cpu_percent);
-            entry.mem_usage_mb = Some(mem_usage_mb);
-            entry.net_rx_bytes = Some(rx_bytes);
-            entry.net_tx_bytes = Some(tx_bytes);
-            entry.last_updated_secs = Some(Utc::now().timestamp()); // ← B1-06
-
-            println!(
-                "[{}] container stats -> cpu: {:.2}%, mem: {:.2} MB, net_rx: {}, net_tx: {}",
-                broker.id, cpu_percent, mem_usage_mb, rx_bytes, tx_bytes
-            );
+            Some(Err(e)) => {                                          // ← B1-07
+                eprintln!("[{}] Docker stats error: {:?}", broker.id, e);
+                state.entry(broker.id.clone()).or_default().docker_online = false; // ← B1-07
+            }
+            None => {                                                  // ← B1-07
+                eprintln!("[{}] Docker stats stream ended unexpectedly", broker.id);
+                state.entry(broker.id.clone()).or_default().docker_online = false; // ← B1-07
+            }
         }
 
         tokio::time::sleep(Duration::from_secs(scrape_interval_secs)).await;
     }
 }
+
 
 async fn spawn_influx_writer(state: SharedState, influx_cfg: config::InfluxConfig, write_interval_secs: u64) {
     // unchanged — no B1-06 edits needed here
@@ -236,7 +265,7 @@ async fn main() {
     // ── B1-06: HTTP server task ───────────────────────────────────────────────
     let app_state = Arc::new(AppState {
         metrics: state.clone(),
-        stale_threshold_secs: (config.intervals.mqtt_scrape_secs * 2) as i64,
+        stale_threshold_secs: (config.intervals.docker_scrape_secs * 2) as i64,
     });
     let router = build_router(app_state);
     handles.push(tokio::spawn(async move {

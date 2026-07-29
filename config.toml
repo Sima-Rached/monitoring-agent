@@ -26,3 +26,4 @@ metric = "cpu_percent"
 operator = ">"
 threshold = 80.0
 cooldown_secs = 60
+
