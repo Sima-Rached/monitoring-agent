@@ -13,6 +13,10 @@ mod config;
 mod http;                                                   // ← B1-06
 use config::{Config, BrokerConfig};
 use http::{AppState, build_router};                        // ← B1-06
+use std::time::Instant;
+use std::sync::Mutex;
+use serde::Serialize;      // needed for FiredAlert — you may already have `serde::Deserialize` imported elsewhere, this adds Serialize
+use config::AlertRule;     // add AlertRule to your existing `use config::{Config, BrokerConfig};` line
 
 #[derive(Default, WriteDataPoint)]
 #[measurement = "broker_metrics"]
@@ -55,6 +59,25 @@ pub struct BrokerMetrics {                                 // ← B1-06: made `p
     pub docker_online: bool,                              // ← B1-07
     pub online: bool,
 }
+
+// ── B2-02: fired alert record ────────────────────────────────────────────────
+// This is intentionally separate from BrokerMetrics (which is scrape-owned) —
+// the alert task owns writes to this store exclusively, same reasoning as the
+// cooldown map below. B2-04 (GET /alerts) will read this store read-only.
+#[derive(Debug, Clone, Serialize)]
+pub struct FiredAlert {
+    pub id: u64,
+    pub broker_id: String,
+    pub metric: String,
+    pub operator: String,
+    pub value: f64,
+    pub threshold: f64,
+    pub fired_at: i64,
+    pub acknowledged: bool,
+}
+
+pub type AlertStore = Arc<Mutex<Vec<FiredAlert>>>;
+pub type CooldownState = Arc<DashMap<String, Instant>>;
 
 pub type SharedState = Arc<DashMap<String, BrokerMetrics>>;  // ← B1-06: made `pub`
 
@@ -187,7 +210,86 @@ async fn run_docker_task(broker: BrokerConfig, state: SharedState, docker: Docke
     }
 }
 
+// ── B2-02: alert evaluation loop ─────────────────────────────────────────────
+async fn run_alert_task(
+    state: SharedState,          // existing metrics map — read only
+    cooldowns: CooldownState,    // this task owns all writes
+    alert_store: AlertStore,     // this task owns all writes
+    rules: Vec<AlertRule>,       // cloned from config at startup, immutable
+    eval_interval_secs: u64,
+) {
+    let mut next_id: u64 = 0;
 
+    loop {
+        tokio::time::sleep(Duration::from_secs(eval_interval_secs)).await;
+
+        for entry in state.iter() {
+            let (broker_id, metrics) = (entry.key().clone(), entry.value());
+
+            for rule in &rules {
+                // Config::load already guarantees rule.metric ∈ VALID_METRICS
+                // and rule.operator ∈ VALID_OPERATORS (B2-01), so no `_ => None`
+                // fallback masking a typo here — every arm is a real field.
+                let value: Option<f64> = match rule.metric.as_str() {
+                    "clients_connected" => metrics.clients_connected.map(|v| v as f64),
+                    "messages_sent" => metrics.messages_sent.map(|v| v as f64),
+                    "messages_received" => metrics.messages_received.map(|v| v as f64),
+                    "bytes_sent" => metrics.bytes_sent.map(|v| v as f64),
+                    "bytes_received" => metrics.bytes_received.map(|v| v as f64),
+                    "cpu_percent" => metrics.cpu_percent,
+                    "mem_usage_mb" => metrics.mem_usage_mb,
+                    "net_rx_bytes" => metrics.net_rx_bytes.map(|v| v as f64),
+                    "net_tx_bytes" => metrics.net_tx_bytes.map(|v| v as f64),
+                    _ => None, // unreachable given B2-01 validation, kept for exhaustiveness
+                };
+
+                let Some(value) = value else { continue }; // no data yet for this metric
+
+                let breached = match rule.operator.as_str() {
+                    ">" => value > rule.threshold,
+                    "<" => value < rule.threshold,
+                    "==" => (value - rule.threshold).abs() < f64::EPSILON,
+                    _ => false, // unreachable given B2-01 validation
+                };
+                if !breached {
+                    continue;
+                }
+
+                let cooldown_key = format!("{}:{}", broker_id, rule.metric);
+                let now = Instant::now();
+
+                if let Some(last_fired) = cooldowns.get(&cooldown_key) {
+                    if now.duration_since(*last_fired).as_secs() < rule.cooldown_secs {
+                        continue; // still in cooldown — suppress duplicate
+                    }
+                }
+                cooldowns.insert(cooldown_key, now);
+
+                let alert = FiredAlert {
+                    id: next_id,
+                    broker_id: broker_id.clone(),
+                    metric: rule.metric.clone(),
+                    operator: rule.operator.clone(),
+                    value,
+                    threshold: rule.threshold,
+                    fired_at: Utc::now().timestamp(),
+                    acknowledged: false,
+                };
+                next_id += 1;
+
+                eprintln!(
+                    "[ALERT] broker={} metric={} value={:.2} {} {} (id={})",
+                    alert.broker_id, alert.metric, alert.value, alert.operator, alert.threshold, alert.id
+                );
+
+                // Lock is held only for this push — no .await inside the
+                // critical section, so std::sync::Mutex is safe here and
+                // cheaper than tokio::sync::Mutex.
+                alert_store.lock().unwrap().push(alert);
+            }
+        }
+    }
+}
 async fn spawn_influx_writer(state: SharedState, influx_cfg: config::InfluxConfig, write_interval_secs: u64) {
     // unchanged — no B1-06 edits needed here
     let client = Client::new(influx_cfg.url, influx_cfg.org, influx_cfg.token);
@@ -277,7 +379,20 @@ async fn main() {
             .await
             .expect("HTTP server error");
     }));
-
+    // ── B2-02: alert evaluation task ─────────────────────────────────────────
+    let cooldowns: CooldownState = Arc::new(DashMap::new());
+    let alert_store: AlertStore = Arc::new(Mutex::new(Vec::new()));
+    let alert_rules = config.alert_rules.clone();
+    let alert_eval_interval = config.intervals.mqtt_scrape_secs; // reuse existing cadence
+    handles.push(tokio::spawn(async move {
+        run_alert_task(
+            state.clone(),
+            cooldowns,
+            alert_store,
+            alert_rules,
+            alert_eval_interval,
+        ).await;
+    }));
     for handle in handles {
         let _ = handle.await;
     }

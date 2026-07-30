@@ -24,6 +24,6 @@ container_name = "mosquitto2"
 [[alert_rules]]
 metric = "cpu_percent"
 operator = ">"
-threshold = 80.0
-cooldown_secs = 60
+threshold = 0.1
+cooldown_secs = 30
 
