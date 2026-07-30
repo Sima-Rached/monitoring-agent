@@ -11,12 +11,18 @@ use futures::stream;
 use chrono::Utc;
 mod config;
 mod http;                                                   // ← B1-06
-use config::{Config, BrokerConfig};
+use config::{Config, BrokerConfig, AlertRule};
 use http::{AppState, build_router};                        // ← B1-06
 use std::time::Instant;
 use std::sync::Mutex;
 use serde::Serialize;      // needed for FiredAlert — you may already have `serde::Deserialize` imported elsewhere, this adds Serialize
-use config::AlertRule;     // add AlertRule to your existing `use config::{Config, BrokerConfig};` line
+use lettre::{
+    Message, SmtpTransport, Transport,
+    message::header::ContentType,
+    transport::smtp::authentication::Credentials,
+};
+use config::EmailConfig;
+
 
 #[derive(Default, WriteDataPoint)]
 #[measurement = "broker_metrics"]
@@ -57,7 +63,6 @@ pub struct BrokerMetrics {                                 // ← B1-06: made `p
     pub last_updated_secs: Option<i64>,                   // ← B1-06: staleness timestamp
     pub mqtt_online: bool,                                 // ← B1-07
     pub docker_online: bool,                              // ← B1-07
-    pub online: bool,
 }
 
 // ── B2-02: fired alert record ────────────────────────────────────────────────
@@ -216,8 +221,19 @@ async fn run_alert_task(
     cooldowns: CooldownState,    // this task owns all writes
     alert_store: AlertStore,     // this task owns all writes
     rules: Vec<AlertRule>,       // cloned from config at startup, immutable
+    email_cfg: EmailConfig,            // ← B2-03
     eval_interval_secs: u64,
 ) {
+    // Build the SMTP transport once — reused for every alert fire.
+    // lettre's SmtpTransport is cheaply cloneable; building it once
+    // avoids reconnecting to the SMTP server on every evaluation tick.
+    let creds = Credentials::new(email_cfg.username.clone(), email_cfg.password.clone());
+    let mailer = SmtpTransport::starttls_relay(&email_cfg.smtp_host)
+        .expect("failed to build SMTP transport")
+        .port(email_cfg.smtp_port)
+        .credentials(creds)
+        .build();
+
     let mut next_id: u64 = 0;
 
     loop {
@@ -285,7 +301,52 @@ async fn run_alert_task(
                 // Lock is held only for this push — no .await inside the
                 // critical section, so std::sync::Mutex is safe here and
                 // cheaper than tokio::sync::Mutex.
-                alert_store.lock().unwrap().push(alert);
+                alert_store.lock().unwrap().push(alert.clone());
+
+                // ── B2-03: send email notification ───────────────────────────
+                // Build one email per recipient — lettre requires a separate
+                // Message per address; the loop is cheap (usually 1 recipient).
+                for recipient in &email_cfg.to {
+                    let body = format!(
+                        "ProgressBox Alert\n\
+                         ─────────────────\n\
+                         Broker:    {}\n\
+                         Metric:    {}\n\
+                         Condition: {} {} {}\n\
+                         Value:     {:.4}\n\
+                         Time:      {} (Unix)\n\
+                         Alert ID:  {}",
+                        alert.broker_id,
+                        alert.metric,
+                        alert.metric, alert.operator, alert.threshold,
+                        alert.value,
+                        alert.fired_at,
+                        alert.id,
+                    );
+
+                    let email = match Message::builder()
+                        .from(email_cfg.from.parse().unwrap())
+                        .to(recipient.parse().unwrap())
+                        .subject(format!(
+                            "[ProgressBox] ALERT — {} {} {} {} on {}",
+                            alert.metric, alert.operator, alert.threshold,
+                            alert.value, alert.broker_id
+                        ))
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(body)
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[ALERT] failed to build email: {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    match mailer.send(&email) {
+                        Ok(_)  => println!("[ALERT] email sent to {}", recipient),
+                        Err(e) => eprintln!("[ALERT] email send failed to {}: {:?}", recipient, e),
+                    }
+                }
             }
         }
     }
@@ -379,10 +440,11 @@ async fn main() {
             .await
             .expect("HTTP server error");
     }));
-    // ── B2-02: alert evaluation task ─────────────────────────────────────────
+    // ── B2-02 + B2-03: alert evaluation task ─────────────────────────────────────────
     let cooldowns: CooldownState = Arc::new(DashMap::new());
     let alert_store: AlertStore = Arc::new(Mutex::new(Vec::new()));
     let alert_rules = config.alert_rules.clone();
+    let email_cfg = config.email.clone();                  // ← B2-03
     let alert_eval_interval = config.intervals.mqtt_scrape_secs; // reuse existing cadence
     handles.push(tokio::spawn(async move {
         run_alert_task(
@@ -390,6 +452,7 @@ async fn main() {
             cooldowns,
             alert_store,
             alert_rules,
+            email_cfg,     //B2-03
             alert_eval_interval,
         ).await;
     }));

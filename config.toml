@@ -24,6 +24,11 @@ container_name = "mosquitto2"
 [[alert_rules]]
 metric = "cpu_percent"
 operator = ">"
-threshold = 0.1
+threshold = 0.01
 cooldown_secs = 30
 
+[email]
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+from = "simarached77@gmail.com"
+to = ["rachedsima25@gmail.com"]

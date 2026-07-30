@@ -1,12 +1,13 @@
 use serde::Deserialize;
 use std::fs;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Config {
     pub influxdb: InfluxConfig,
     pub intervals: IntervalsConfig,
     pub brokers: Vec<BrokerConfig>,
-    #[serde(default)]
+    pub email: EmailConfig,            // ← B2-03
+    #[allow(dead_code)]
     pub alert_rules: Vec<AlertRule>,
 }
 
@@ -39,6 +40,30 @@ pub struct AlertRule {
     pub operator: String,
     pub threshold: f64,
     pub cooldown_secs: u64,
+}
+
+// ── B2-03: email config ───────────────────────────────────────────────────────
+// smtp_host, smtp_port, from, to come from config.toml (safe to commit).
+// username and password are injected from env vars at load time — never
+// written to disk.
+#[derive(Debug, Clone)]
+pub struct EmailConfig {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub from: String,
+    pub to: Vec<String>,
+    pub username: String,   // from SMTP_USERNAME env var
+    pub password: String,   // from SMTP_PASSWORD env var
+}
+
+// Intermediate struct that serde deserializes into —
+// does not include credentials (those come from env).
+#[derive(Debug, Deserialize)]
+struct EmailConfigRaw {
+    smtp_host: String,
+    smtp_port: u16,
+    from: String,
+    to: Vec<String>,
 }
 
 // ── B2-01: validation ────────────────────────────────────────────────────────
@@ -88,18 +113,50 @@ impl AlertRule {
     }
 }
 
+// Intermediate top-level struct that serde deserializes into —
+// email.username/password are not present here.
+#[derive(Debug, Deserialize)]
+struct ConfigRaw {
+    influxdb: InfluxConfig,
+    intervals: IntervalsConfig,
+    brokers: Vec<BrokerConfig>,
+    email: EmailConfigRaw,
+    #[serde(default)]
+    alert_rules: Vec<AlertRule>,
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self, String> {
         let raw = fs::read_to_string(path)
             .map_err(|e| format!("failed to read config file '{}': {}", path, e))?;
-        let config: Config = toml::from_str(&raw)
+
+        let raw_cfg: ConfigRaw = toml::from_str(&raw)
             .map_err(|e| format!("invalid config in '{}': {}", path, e))?;
 
-        // ── B2-01: reject unknown metrics or bad operators at load time ──────
-        for (i, rule) in config.alert_rules.iter().enumerate() {
+        // ── B2-03: read credentials from env — fail fast if missing ──────────
+        let username = std::env::var("SMTP_USERNAME")
+            .map_err(|_| "missing env var SMTP_USERNAME".to_string())?;
+        let password = std::env::var("SMTP_PASSWORD")
+            .map_err(|_| "missing env var SMTP_PASSWORD".to_string())?;
+
+        // ── B2-01: validate alert rules ───────────────────────────────────────
+        for (i, rule) in raw_cfg.alert_rules.iter().enumerate() {
             rule.validate(i)?;
         }
 
-        Ok(config)
+        Ok(Config {
+            influxdb: raw_cfg.influxdb,
+            intervals: raw_cfg.intervals,
+            brokers: raw_cfg.brokers,
+            email: EmailConfig {
+                smtp_host: raw_cfg.email.smtp_host,
+                smtp_port: raw_cfg.email.smtp_port,
+                from: raw_cfg.email.from,
+                to: raw_cfg.email.to,
+                username,
+                password,
+            },
+            alert_rules: raw_cfg.alert_rules,
+        })
     }
 }
