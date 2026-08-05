@@ -2,7 +2,7 @@
 url = "http://localhost:8086"
 org = "monitoring-org"
 bucket = "broker-metrics"
-token = "dev-token-please-change"
+token = "token"
 
 [intervals]
 mqtt_scrape_secs = 2

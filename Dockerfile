@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 COPY --from=builder /app/target/release/agent ./agent
 COPY config.toml ./config.toml
+COPY rules.toml ./rules.toml
 
 EXPOSE 3000
 CMD ["./agent"]

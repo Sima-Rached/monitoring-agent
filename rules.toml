@@ -22,7 +22,7 @@ cooldown_secs = 300
 metric = "mem_usage_mb"
 operator = ">"
 threshold = 512.0
-cooldown_secs = 300
+cooldown_secs = 30
 
 [[alert_rules]]
 metric = "clients_connected"

@@ -35,7 +35,7 @@ services:
       - influxdb-data:/var/lib/influxdb2
 
   agent:
-    image: simarached/progressbox-agent:1.0
+    image: simarached/progressbox-agent:1.1
     container_name: progressbox-agent
     network_mode: host
     ports:
@@ -43,8 +43,10 @@ services:
     environment:
       - SMTP_USERNAME=${SMTP_USERNAME:?SMTP_USERNAME must be set}
       - SMTP_PASSWORD=${SMTP_PASSWORD:?SMTP_PASSWORD must be set}
+      - AGENT_HOSTNAME=${AGENT_HOSTNAME:-} 
     volumes:
       - ./config.toml:/app/config.toml:ro
+      - ./rules.toml:/app/rules.toml:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - mosquitto
