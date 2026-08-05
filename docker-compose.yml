@@ -3,36 +3,53 @@ services:
     image: eclipse-mosquitto:2
     container_name: mosquitto
     ports:
-      - "1883:1883"
+      - "${MOSQUITTO1_HOST_PORT:-1883}:1883"
     volumes:
-      - ~/mosquitto/config:/mosquitto/config
-      - ~/mosquitto/data:/mosquitto/data
-      - ~/mosquitto/log:/mosquitto/log
+      - ${MOSQUITTO1_CONFIG_DIR:-~/mosquitto/config}:/mosquitto/config
+      - ${MOSQUITTO1_DATA_DIR:-~/mosquitto/data}:/mosquitto/data
+      - ${MOSQUITTO1_LOG_DIR:-~/mosquitto/log}:/mosquitto/log
 
   mosquitto2:
     image: eclipse-mosquitto:2
     container_name: mosquitto2
     ports:
-      - "1884:1883"
+      - "${MOSQUITTO2_HOST_PORT:-1884}:1883"
     volumes:
-      - ~/mosquitto/config2:/mosquitto/config
-      - ~/mosquitto/data2:/mosquitto/data
-      - ~/mosquitto/log2:/mosquitto/log
+      - ${MOSQUITTO2_CONFIG_DIR:-~/mosquitto/config2}:/mosquitto/config
+      - ${MOSQUITTO2_DATA_DIR:-~/mosquitto/data2}:/mosquitto/data
+      - ${MOSQUITTO2_LOG_DIR:-~/mosquitto/log2}:/mosquitto/log
 
   influxdb:
     image: influxdb:2.7
     container_name: influxdb
     ports:
-      - "8086:8086"
+      - "${INFLUXDB_HOST_PORT:-8086}:8086"
     environment:
       - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_USERNAME=admin
-      - DOCKER_INFLUXDB_INIT_PASSWORD=adminpassword123
-      - DOCKER_INFLUXDB_INIT_ORG=monitoring-org
-      - DOCKER_INFLUXDB_INIT_BUCKET=broker-metrics
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=dev-token-please-change
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USERNAME:-admin}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD:?INFLUXDB_PASSWORD must be set}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-monitoring-org}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-broker-metrics}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:?INFLUXDB_TOKEN must be set}
     volumes:
       - influxdb-data:/var/lib/influxdb2
+
+  agent:
+    image: simarached/progressbox-agent:1.0
+    container_name: progressbox-agent
+    network_mode: host
+    ports:
+      - "${AGENT_HOST_PORT:-3000}:3000"
+    environment:
+      - SMTP_USERNAME=${SMTP_USERNAME:?SMTP_USERNAME must be set}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:?SMTP_PASSWORD must be set}
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - mosquitto
+      - mosquitto2
+      - influxdb
 
 volumes:
   influxdb-data:

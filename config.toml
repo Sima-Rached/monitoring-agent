@@ -30,5 +30,5 @@ cooldown_secs = 30
 [email]
 smtp_host = "smtp.gmail.com"
 smtp_port = 587
-from = "simarached77@gmail.com"
-to = ["rachedsima25@gmail.com"]
+from = "your-source@domaine.com"
+to = ["your-destination@domaine.com"]
