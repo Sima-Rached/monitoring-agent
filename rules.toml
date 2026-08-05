@@ -1,0 +1,31 @@
+# Alert rules — edit this file and call POST /reload to apply changes
+# without restarting the agent. If the file fails validation the reload
+# is rejected and the previously-loaded rules stay active.
+#
+# Supported metrics:
+#   clients_connected, messages_sent, messages_received,
+#   bytes_sent, bytes_received, cpu_percent, mem_usage_mb,
+#   net_rx_bytes, net_tx_bytes
+#
+# Supported operators: >  <  ==
+#
+# cooldown_secs must be > 0 — suppresses repeat alerts for the same
+# broker+metric pair within the window.
+
+[[alert_rules]]
+metric = "cpu_percent"
+operator = ">"
+threshold = 80.0
+cooldown_secs = 300
+
+[[alert_rules]]
+metric = "mem_usage_mb"
+operator = ">"
+threshold = 512.0
+cooldown_secs = 300
+
+[[alert_rules]]
+metric = "clients_connected"
+operator = ">"
+threshold = 1000.0
+cooldown_secs = 60

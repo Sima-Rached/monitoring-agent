@@ -5,21 +5,17 @@ use lettre::{
 };
 use std::time::{Duration, Instant};
 
-use crate::config::{AlertRule, EmailConfig};
-use crate::types::{AlertStore, CooldownState, FiredAlert, SharedState};
+use crate::config::EmailConfig;
+use crate::types::{AlertStore, CooldownState, FiredAlert, RulesStore, SharedState};
 
-// ── B2-02: alert evaluation loop ─────────────────────────────────────────────
 pub async fn run_alert_task(
-    state: SharedState,          // existing metrics map — read only
-    cooldowns: CooldownState,    // this task owns all writes
-    alert_store: AlertStore,     // this task owns all writes
-    rules: Vec<AlertRule>,       // cloned from config at startup, immutable
-    email_cfg: EmailConfig,            // ← B2-03
+    state: SharedState,
+    cooldowns: CooldownState,
+    alert_store: AlertStore,
+    rules_store: RulesStore,      // ← replaces the cloned Vec<AlertRule>
+    email_cfg: EmailConfig,
     eval_interval_secs: u64,
 ) {
-    // Build the SMTP transport once — reused for every alert fire.
-    // lettre's SmtpTransport is cheaply cloneable; building it once
-    // avoids reconnecting to the SMTP server on every evaluation tick.
     let creds = Credentials::new(email_cfg.username.clone(), email_cfg.password.clone());
     let mailer = SmtpTransport::starttls_relay(&email_cfg.smtp_host)
         .expect("failed to build SMTP transport")
@@ -32,33 +28,39 @@ pub async fn run_alert_task(
     loop {
         tokio::time::sleep(Duration::from_secs(eval_interval_secs)).await;
 
+        // Take a point-in-time snapshot of the rules under a read lock.
+        // The lock is released immediately after the clone so the eval
+        // loop below (which may be slow on many brokers) never holds it.
+        let rules = rules_store.read().await.clone();
+
+        if rules.is_empty() {
+            continue;
+        }
+
         for entry in state.iter() {
             let (broker_id, metrics) = (entry.key().clone(), entry.value());
 
             for rule in &rules {
-                // Config::load already guarantees rule.metric ∈ VALID_METRICS
-                // and rule.operator ∈ VALID_OPERATORS (B2-01), so no `_ => None`
-                // fallback masking a typo here — every arm is a real field.
                 let value: Option<f64> = match rule.metric.as_str() {
-                    "clients_connected" => metrics.clients_connected.map(|v| v as f64),
-                    "messages_sent" => metrics.messages_sent.map(|v| v as f64),
-                    "messages_received" => metrics.messages_received.map(|v| v as f64),
-                    "bytes_sent" => metrics.bytes_sent.map(|v| v as f64),
-                    "bytes_received" => metrics.bytes_received.map(|v| v as f64),
-                    "cpu_percent" => metrics.cpu_percent,
-                    "mem_usage_mb" => metrics.mem_usage_mb,
-                    "net_rx_bytes" => metrics.net_rx_bytes.map(|v| v as f64),
-                    "net_tx_bytes" => metrics.net_tx_bytes.map(|v| v as f64),
-                    _ => None, // unreachable given B2-01 validation, kept for exhaustiveness
+                    "clients_connected"  => metrics.clients_connected.map(|v| v as f64),
+                    "messages_sent"      => metrics.messages_sent.map(|v| v as f64),
+                    "messages_received"  => metrics.messages_received.map(|v| v as f64),
+                    "bytes_sent"         => metrics.bytes_sent.map(|v| v as f64),
+                    "bytes_received"     => metrics.bytes_received.map(|v| v as f64),
+                    "cpu_percent"        => metrics.cpu_percent,
+                    "mem_usage_mb"       => metrics.mem_usage_mb,
+                    "net_rx_bytes"       => metrics.net_rx_bytes.map(|v| v as f64),
+                    "net_tx_bytes"       => metrics.net_tx_bytes.map(|v| v as f64),
+                    _ => None, // unreachable given validation in RulesConfig::load
                 };
 
-                let Some(value) = value else { continue }; // no data yet for this metric
+                let Some(value) = value else { continue };
 
                 let breached = match rule.operator.as_str() {
-                    ">" => value > rule.threshold,
-                    "<" => value < rule.threshold,
+                    ">" =>  value > rule.threshold,
+                    "<" =>  value < rule.threshold,
                     "==" => (value - rule.threshold).abs() < f64::EPSILON,
-                    _ => false, // unreachable given B2-01 validation
+                    _ => false,
                 };
                 if !breached {
                     continue;
@@ -69,7 +71,7 @@ pub async fn run_alert_task(
 
                 if let Some(last_fired) = cooldowns.get(&cooldown_key) {
                     if now.duration_since(*last_fired).as_secs() < rule.cooldown_secs {
-                        continue; // still in cooldown — suppress duplicate
+                        continue;
                     }
                 }
                 cooldowns.insert(cooldown_key, now);
@@ -88,17 +90,12 @@ pub async fn run_alert_task(
 
                 eprintln!(
                     "[ALERT] broker={} metric={} value={:.2} {} {} (id={})",
-                    alert.broker_id, alert.metric, alert.value, alert.operator, alert.threshold, alert.id
+                    alert.broker_id, alert.metric, alert.value,
+                    alert.operator, alert.threshold, alert.id
                 );
 
-                // Lock is held only for this push — no .await inside the
-                // critical section, so std::sync::Mutex is safe here and
-                // cheaper than tokio::sync::Mutex.
                 alert_store.lock().unwrap().push(alert.clone());
 
-                // ── B2-03: send email notification ───────────────────────────
-                // Build one email per recipient — lettre requires a separate
-                // Message per address; the loop is cheap (usually 1 recipient).
                 for recipient in &email_cfg.to {
                     let body = format!(
                         "ProgressBox Alert\n\

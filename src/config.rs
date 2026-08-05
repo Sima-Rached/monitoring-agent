@@ -6,9 +6,8 @@ pub struct Config {
     pub influxdb: InfluxConfig,
     pub intervals: IntervalsConfig,
     pub brokers: Vec<BrokerConfig>,
-    pub email: EmailConfig,            // ← B2-03
-    #[allow(dead_code)]
-    pub alert_rules: Vec<AlertRule>,
+    pub email: EmailConfig,
+    // alert_rules removed — now live in rules.toml, loaded via RulesConfig::load()
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,12 +65,11 @@ struct EmailConfigRaw {
     to: Vec<String>,
 }
 
-// ── B2-01: validation ────────────────────────────────────────────────────────
+// ── Alert rule validation ─────────────────────────────────────────────────────
 // Every metric an alert rule is allowed to reference must exist on
-// `BrokerMetrics` (main.rs) and be numeric — this list is the single source
-// of truth both config validation and the future alert-evaluation task
-// (B2-02) should read from.
-const VALID_METRICS: &[&str] = &[
+// `BrokerMetrics` and be numeric — this list is the single source of truth
+// for both config validation and the alert-evaluation task.
+pub const VALID_METRICS: &[&str] = &[
     "clients_connected",
     "messages_sent",
     "messages_received",
@@ -83,13 +81,13 @@ const VALID_METRICS: &[&str] = &[
     "net_tx_bytes",
 ];
 
-const VALID_OPERATORS: &[&str] = &[">", "<", "=="];
+pub const VALID_OPERATORS: &[&str] = &[">", "<", "=="];
 
 impl AlertRule {
-    fn validate(&self, index: usize) -> Result<(), String> {
+    pub fn validate(&self, index: usize) -> Result<(), String> {
         if !VALID_METRICS.contains(&self.metric.as_str()) {
             return Err(format!(
-                "alert_rules[{}]: unknown metric '{}' (valid metrics: {})",
+                "alert_rules[{}]: unknown metric '{}' (valid: {})",
                 index,
                 self.metric,
                 VALID_METRICS.join(", ")
@@ -97,7 +95,7 @@ impl AlertRule {
         }
         if !VALID_OPERATORS.contains(&self.operator.as_str()) {
             return Err(format!(
-                "alert_rules[{}]: invalid operator '{}' (valid operators: {})",
+                "alert_rules[{}]: invalid operator '{}' (valid: {})",
                 index,
                 self.operator,
                 VALID_OPERATORS.join(", ")
@@ -113,16 +111,44 @@ impl AlertRule {
     }
 }
 
-// Intermediate top-level struct that serde deserializes into —
-// email.username/password are not present here.
+// ── RulesConfig ───────────────────────────────────────────────────────────────
+// Loaded from a separate file (default: rules.toml, override with RULES_PATH
+// env var). Called at startup and again on every POST /reload — the reload
+// handler rejects bad files and keeps the old rules active, so a typo in
+// rules.toml never silently kills alerting.
+#[derive(Debug, Deserialize)]
+struct RulesFile {
+    #[serde(default)]
+    alert_rules: Vec<AlertRule>,
+}
+
+pub struct RulesConfig {
+    pub alert_rules: Vec<AlertRule>,
+}
+
+impl RulesConfig {
+    pub fn load(path: &str) -> Result<Self, String> {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read rules file '{}': {}", path, e))?;
+
+        let parsed: RulesFile = toml::from_str(&raw)
+            .map_err(|e| format!("invalid rules in '{}': {}", path, e))?;
+
+        for (i, rule) in parsed.alert_rules.iter().enumerate() {
+            rule.validate(i)?;
+        }
+
+        Ok(RulesConfig { alert_rules: parsed.alert_rules })
+    }
+}
+
+// Intermediate top-level struct for config.toml — alert_rules no longer here.
 #[derive(Debug, Deserialize)]
 struct ConfigRaw {
     influxdb: InfluxConfig,
     intervals: IntervalsConfig,
     brokers: Vec<BrokerConfig>,
     email: EmailConfigRaw,
-    #[serde(default)]
-    alert_rules: Vec<AlertRule>,
 }
 
 impl Config {
@@ -133,16 +159,11 @@ impl Config {
         let raw_cfg: ConfigRaw = toml::from_str(&raw)
             .map_err(|e| format!("invalid config in '{}': {}", path, e))?;
 
-        // ── B2-03: read credentials from env — fail fast if missing ──────────
+        // Read credentials from env — fail fast if missing.
         let username = std::env::var("SMTP_USERNAME")
             .map_err(|_| "missing env var SMTP_USERNAME".to_string())?;
         let password = std::env::var("SMTP_PASSWORD")
             .map_err(|_| "missing env var SMTP_PASSWORD".to_string())?;
-
-        // ── B2-01: validate alert rules ───────────────────────────────────────
-        for (i, rule) in raw_cfg.alert_rules.iter().enumerate() {
-            rule.validate(i)?;
-        }
 
         Ok(Config {
             influxdb: raw_cfg.influxdb,
@@ -156,7 +177,6 @@ impl Config {
                 username,
                 password,
             },
-            alert_rules: raw_cfg.alert_rules,
         })
     }
 }

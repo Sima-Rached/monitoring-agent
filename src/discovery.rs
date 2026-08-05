@@ -77,8 +77,15 @@ async fn reconcile(docker: &Docker, runtime: &BrokerRuntime, registry: &BrokerRe
     // New: discovered but not registered.
     for (id, broker) in &discovered {
         if !currently_registered.contains(id) {
-            println!("[discovery] found new broker '{}', registering", id);
-            registry::spawn_broker(broker.clone(), runtime, registry);
+            if registry::is_suppressed(id) {
+                // A human explicitly DELETEd this broker and its label is
+                // still present. Respect that until the label/container
+                // actually disappears — don't just resync it back in.
+                println!("[discovery] broker '{}' is suppressed (manually deleted), not re-registering", id);
+            } else {
+                println!("[discovery] found new broker '{}', registering", id);
+                registry::spawn_broker(broker.clone(), runtime, registry);
+            }
         }
         // Record every id we currently see labeled, whether or not it was
         // just spawned. This is what makes `was_previously_discovered` mean
@@ -95,12 +102,25 @@ async fn reconcile(docker: &Docker, runtime: &BrokerRuntime, registry: &BrokerRe
     for id in &currently_registered {
         if !discovered.contains_key(id) && was_previously_discovered(id) {
             println!("[discovery] broker '{}' no longer present, deregistering", id);
-            registry::stop_broker(id, runtime.state.clone(), registry);
+            // Not a manual delete — the container/label genuinely vanished —
+            // so use the non-suppressing stop. If a broker with this id
+            // shows up again later it should be treated as brand new.
+            registry::stop_broker_no_suppress(id, runtime.state.clone(), registry);
             // The container is gone — stop tracking it too, so if a broker
             // with the same id is later added manually via POST /brokers,
             // a stray label-container reappearing later is treated as
             // genuinely new rather than silently interacting with old state.
             unmark_discovered(id);
+        }
+    }
+
+    // Clear suppression once a container's label/existence actually goes
+    // away — a *new* container that happens to reuse this id later should
+    // be treated as genuinely new, not permanently blocked by an old delete.
+    for id in registry::suppressed_ids() {
+        if !discovered.contains_key(&id) {
+            println!("[discovery] suppressed broker '{}' no longer labeled/present, clearing suppression", id);
+            registry::unsuppress(&id);
         }
     }
 }
