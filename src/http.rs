@@ -8,6 +8,8 @@ use chrono::Utc;
 use serde::Serialize;
 use std::sync::Arc;
 use dashmap::DashMap;
+use influxdb2::Client as InfluxClient;
+
 
 use crate::config::{BrokerConfig, RulesConfig};
 use crate::registry::{self, BrokerRuntime};
@@ -147,6 +149,139 @@ pub async fn get_api_v1_metrics(
         Json(serde_json::json!({ "brokers": brokers, "count": count })),
     )
 }
+
+// ── GET /api/v1/metrics/history ───────────────────────────────────────────────
+// B3-02: historical metric snapshots for a broker over a time window.
+// ?from= and ?to= are RFC 3339 / ISO 8601 (e.g. 2026-07-01T00:00:00Z).
+// ?broker_id= is required — historical queries without a broker filter would
+// scan the full series and are not useful for this endpoint's audience.
+// Pagination: ?limit= (default 100, max 1000) + ?offset= (default 0).
+// Empty time range → 200 with empty results array, never a 4xx.
+
+#[derive(serde::Deserialize)]
+pub struct HistoryQuery {
+    pub broker_id: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize, influxdb2::FromDataPoint)]
+pub struct BrokerMetricsHistory {
+    #[serde(rename = "broker_id")]
+    pub broker_id: String,
+    pub clients_connected: i64,
+    pub messages_sent: i64,
+    pub messages_received: i64,
+    pub bytes_sent: i64,
+    pub bytes_received: i64,
+    pub cpu_percent: f64,
+    pub mem_usage_mb: f64,
+    pub time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+impl Default for BrokerMetricsHistory {
+    fn default() -> Self {
+        Self {
+            broker_id: String::new(),
+            clients_connected: 0,
+            messages_sent: 0,
+            messages_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            cpu_percent: 0.0,
+            mem_usage_mb: 0.0,
+            time: chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z").unwrap(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct HistoryEnvelope {
+    pub broker_id: String,
+    pub from: String,
+    pub to: String,
+    pub limit: usize,
+    pub offset: usize,
+    pub count: usize,
+    pub results: Vec<BrokerMetricsHistory>,
+}
+
+pub async fn get_api_v1_metrics_history(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HistoryQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Validate ?from=
+    if chrono::DateTime::parse_from_rfc3339(&q.from).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("invalid 'from' timestamp '{}': must be ISO 8601 / RFC 3339 (e.g. 2026-07-01T00:00:00Z)", q.from)
+            })),
+        );
+    }
+
+    // ?to= defaults to now if omitted.
+    let to = q.to.clone().unwrap_or_else(|| Utc::now().to_rfc3339());
+    if chrono::DateTime::parse_from_rfc3339(&to).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("invalid 'to' timestamp '{}': must be ISO 8601 / RFC 3339", to)
+            })),
+        );
+    }
+
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let offset = q.offset.unwrap_or(0);
+
+    // Flux query — filter by broker_id tag, apply time range, sort ascending,
+    // then paginate with limit/offset at the Flux level to avoid pulling a
+    // large result set into the agent process.
+    let flux = format!(
+        r#"from(bucket: "{bucket}")
+  |> range(start: {from}, stop: {to})
+  |> filter(fn: (r) => r._measurement == "broker_metrics")
+  |> filter(fn: (r) => r.broker_id == "{broker_id}")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"], desc: false)
+  |> limit(n: {limit}, offset: {offset})"#,
+        bucket = state.influx_bucket,
+        from = q.from,
+        to = to,
+        broker_id = q.broker_id,
+        limit = limit,
+        offset = offset,
+    );
+
+    let query = influxdb2::models::Query::new(flux);
+
+    match state.influx_client.query::<BrokerMetricsHistory>(Some(query)).await {
+        Ok(results) => {
+            let count = results.len();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "broker_id": q.broker_id,
+                    "from": q.from,
+                    "to": to,
+                    "limit": limit,
+                    "offset": offset,
+                    "count": count,
+                    "results": results,
+                })),
+            )
+        }
+        Err(e) => {
+            eprintln!("[history] InfluxDB query error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "InfluxDB query failed" })),
+            )
+        }
+    }
+}
 // ── Response types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -196,6 +331,8 @@ pub struct AppState {
     pub rules_store: RulesStore,       // shared with the alert task
     pub cooldowns: CooldownState,      // shared with the alert task; cleared on reload
     pub rules_path: String,            // path to rules.toml, resolved once at startup
+    pub influx_client: Arc<InfluxClient>,   
+    pub influx_bucket: String,
 }
 
 // ── GET /metrics ──────────────────────────────────────────────────────────────
@@ -369,5 +506,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/alerts/:id/acknowledge", patch(patch_alert_acknowledge)) 
         .route("/reload", post(post_reload))
         .route("/api/v1/metrics", get(get_api_v1_metrics))
+        .route("/api/v1/metrics/history", get(get_api_v1_metrics_history))
         .with_state(state)
 }

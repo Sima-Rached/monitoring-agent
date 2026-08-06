@@ -57,9 +57,19 @@ async fn main() {
         registry::spawn_broker(broker.clone(), &broker_runtime, &broker_registry);
     }
 
-    let state_clone = state.clone();
     let influx_cfg = config.influxdb;
     let influx_interval = config.intervals.influx_write_secs;
+    // Build the InfluxDB client once — shared between the writer task and the
+    // HTTP history handler. The writer task keeps its own clone (cheap, it's
+    // Arc-backed internally), so no ownership conflict.
+    let influx_client = Arc::new(influxdb2::Client::new(
+        &influx_cfg.url,
+        &influx_cfg.org,
+        &influx_cfg.token,
+    ));
+    let influx_bucket = influx_cfg.bucket.clone();
+
+    let state_clone = state.clone();
     handles.push(tokio::spawn(async move {
         influx::spawn_influx_writer(state_clone, influx_cfg, influx_interval).await;
     }));
@@ -75,6 +85,10 @@ async fn main() {
     let rules_store: RulesStore = Arc::new(RwLock::new(initial_rules));
     let cooldowns: CooldownState = Arc::new(DashMap::new());
     let alert_store: AlertStore = Arc::new(Mutex::new(Vec::new()));
+    
+
+    // Pass to writer task as before (adjust spawn to use influx_cfg directly
+    // or clone the fields — whichever fits your current move semantics).
 
     let app_state = Arc::new(AppState {
         metrics: state.clone(),
@@ -85,6 +99,8 @@ async fn main() {
         rules_store: rules_store.clone(),
         cooldowns: cooldowns.clone(),
         rules_path,
+        influx_client,
+        influx_bucket,
     });
 
     let router = build_router(app_state);

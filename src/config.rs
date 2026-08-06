@@ -10,7 +10,7 @@ pub struct Config {
     // alert_rules removed — now live in rules.toml, loaded via RulesConfig::load()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct InfluxConfig {
     pub url: String,
     pub org: String,
