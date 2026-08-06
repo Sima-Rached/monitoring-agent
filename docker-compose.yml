@@ -44,6 +44,7 @@ services:
       - SMTP_USERNAME=${SMTP_USERNAME:?SMTP_USERNAME must be set}
       - SMTP_PASSWORD=${SMTP_PASSWORD:?SMTP_PASSWORD must be set}
       - AGENT_HOSTNAME=${AGENT_HOSTNAME:-} 
+      - API_KEY=${API_KEY:?API_KEY must be set}
     volumes:
       - ./config.toml:/app/config.toml:ro
       - ./rules.toml:/app/rules.toml:ro

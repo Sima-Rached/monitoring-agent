@@ -57,6 +57,8 @@ async fn main() {
         registry::spawn_broker(broker.clone(), &broker_runtime, &broker_registry);
     }
 
+    // Pass to writer task as before (adjust spawn to use influx_cfg directly
+    // or clone the fields — whichever fits your current move semantics).
     let influx_cfg = config.influxdb;
     let influx_interval = config.intervals.influx_write_secs;
     // Build the InfluxDB client once — shared between the writer task and the
@@ -86,9 +88,12 @@ async fn main() {
     let cooldowns: CooldownState = Arc::new(DashMap::new());
     let alert_store: AlertStore = Arc::new(Mutex::new(Vec::new()));
     
-
-    // Pass to writer task as before (adjust spawn to use influx_cfg directly
-    // or clone the fields — whichever fits your current move semantics).
+    // API key — read from env at startup. Fail fast if absent so the agent
+    // never starts in an inadvertently open state.
+    let api_key = std::env::var("API_KEY").unwrap_or_else(|_| {
+        eprintln!("Error: API_KEY env var must be set");
+        std::process::exit(1);
+    });
 
     let app_state = Arc::new(AppState {
         metrics: state.clone(),
@@ -101,6 +106,7 @@ async fn main() {
         rules_path,
         influx_client,
         influx_bucket,
+        api_key,
     });
 
     let router = build_router(app_state);

@@ -1,6 +1,8 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post, patch},
     Json, Router,
 };
@@ -333,6 +335,7 @@ pub struct AppState {
     pub rules_path: String,            // path to rules.toml, resolved once at startup
     pub influx_client: Arc<InfluxClient>,   
     pub influx_bucket: String,
+    pub api_key: String,
 }
 
 // ── GET /metrics ──────────────────────────────────────────────────────────────
@@ -495,17 +498,72 @@ pub async fn post_reload(
     )
 }
 
+// ── API key middleware ────────────────────────────────────────────────────────
+// Applied only to /api/v1/* routes. Reads the X-Api-Key request header and
+// rejects with 401 if it is absent or does not match the configured key.
+//
+// Constant-time comparison (via == on &[u8]) is used to prevent timing
+// attacks — both sides are hashed to the same length before comparing.
+// The key is never written to logs, traces, or error responses.
+
+pub async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let provided = req
+        .headers()
+        .get("X-Api-Key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // Constant-time comparison — prevents timing oracle on key length/prefix.
+    let expected = state.api_key.as_bytes();
+    let provided_bytes = provided.as_bytes();
+
+    let valid = expected.len() == provided_bytes.len()
+        && expected
+            .iter()
+            .zip(provided_bytes.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+
+    if valid {
+        next.run(req).await
+    } else {
+        // 401, not 403 — the client needs to authenticate, not just authorise.
+        // No detail in the body — don't hint whether the key exists at all.
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing or invalid API key" })),
+        )
+            .into_response()
+    }
+}
+
 // ── Router factory ────────────────────────────────────────────────────────────
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Internal routes — no auth required.
+    let internal = Router::new()
         .route("/metrics", get(get_metrics))
         .route("/brokers", get(get_brokers).post(post_broker))
         .route("/brokers/:id", delete(delete_broker))
         .route("/alerts", get(get_alerts))
-        .route("/alerts/:id/acknowledge", patch(patch_alert_acknowledge)) 
-        .route("/reload", post(post_reload))
-        .route("/api/v1/metrics", get(get_api_v1_metrics))
-        .route("/api/v1/metrics/history", get(get_api_v1_metrics_history))
+        .route("/alerts/:id/acknowledge", patch(patch_alert_acknowledge))
+        .route("/reload", post(post_reload));
+
+    // Versioned external API — API key required on every request.
+    let api_v1 = Router::new()
+        .route("/metrics", get(get_api_v1_metrics))
+        .route("/metrics/history", get(get_api_v1_metrics_history))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
+
+    Router::new()
+        .merge(internal)
+        .nest("/api/v1", api_v1)
         .with_state(state)
 }
