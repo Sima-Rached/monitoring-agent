@@ -78,6 +78,75 @@ pub async fn patch_alert_acknowledge(
     }
 }
 
+// ── GET /api/v1/metrics ───────────────────────────────────────────────────────
+// B3-01: versioned API endpoint. Optional ?broker_id= filter; returns all
+// brokers when omitted. Reuses BrokerMetricsResponse — same shape as the
+// internal GET /metrics, so consumers can migrate without schema changes.
+
+#[derive(serde::Deserialize)]
+pub struct MetricsQuery {
+    pub broker_id: Option<String>,
+}
+
+pub async fn get_api_v1_metrics(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MetricsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let now = Utc::now().timestamp();
+
+    // If a broker_id filter was supplied but that id isn't in the state,
+    // return 404 rather than an empty brokers array — an empty array is
+    // ambiguous (no brokers at all vs. wrong id). 404 is unambiguous.
+    if let Some(ref id) = q.broker_id {
+        if !state.metrics.contains_key(id.as_str()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("broker '{}' not found", id) })),
+            );
+        }
+    }
+
+    let mut brokers: Vec<BrokerMetricsResponse> = state
+        .metrics
+        .iter()
+        .filter(|entry| {
+            q.broker_id.as_deref().map_or(true, |id| entry.key() == id)
+        })
+        .map(|entry| {
+            let (broker_id, m) = (entry.key().clone(), entry.value());
+
+            let stale = match m.last_updated_secs {
+                Some(ts) => (now - ts) > state.stale_threshold_secs,
+                None => true,
+            };
+
+            BrokerMetricsResponse {
+                broker_id,
+                clients_connected: m.clients_connected,
+                messages_sent: m.messages_sent,
+                messages_received: m.messages_received,
+                bytes_sent: m.bytes_sent,
+                bytes_received: m.bytes_received,
+                cpu_percent: m.cpu_percent,
+                mem_usage_mb: m.mem_usage_mb,
+                net_rx_bytes: m.net_rx_bytes,
+                net_tx_bytes: m.net_tx_bytes,
+                last_updated_secs: m.last_updated_secs,
+                stale,
+                mqtt_online: m.mqtt_online,
+                docker_online: m.docker_online,
+                online: m.mqtt_online && m.docker_online,
+            }
+        })
+        .collect();
+
+    brokers.sort_by(|a, b| a.broker_id.cmp(&b.broker_id));
+    let count = brokers.len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "brokers": brokers, "count": count })),
+    )
+}
 // ── Response types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -299,5 +368,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/alerts", get(get_alerts))
         .route("/alerts/:id/acknowledge", patch(patch_alert_acknowledge)) 
         .route("/reload", post(post_reload))
+        .route("/api/v1/metrics", get(get_api_v1_metrics))
         .with_state(state)
 }
