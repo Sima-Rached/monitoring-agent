@@ -2,6 +2,7 @@ use bollard::Docker;
 use dashmap::DashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
+use std::net::SocketAddr;
 
 mod alerts;
 mod config;
@@ -88,6 +89,19 @@ async fn main() {
     let cooldowns: CooldownState = Arc::new(DashMap::new());
     let alert_store: AlertStore = Arc::new(Mutex::new(Vec::new()));
     
+    // Rate limit config — from env with sane defaults.
+    // per_second: how many requests replenish per second per IP.
+    // burst: how many requests above the steady rate are allowed before blocking.
+    let rate_limit_per_second: u64 = std::env::var("RATE_LIMIT_PER_SECOND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    let rate_limit_burst: u32 = std::env::var("RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
     // API key — read from env at startup. Fail fast if absent so the agent
     // never starts in an inadvertently open state.
     let api_key = std::env::var("API_KEY").unwrap_or_else(|_| {
@@ -107,17 +121,26 @@ async fn main() {
         influx_client,
         influx_bucket,
         api_key,
+        rate_limit_per_second,   
+        rate_limit_burst,
     });
 
     let router = build_router(app_state);
+    //CRITICAL: must use into_make_service_with_connect_info — PeerIpKeyExtractor
+    // reads SocketAddr from request extensions, which axum only injects when
+    // connect_info is enabled. Without this, every request fails with
+    // GovernorError::UnableToExtractKey and gets a 500.
     handles.push(tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
             .await
             .expect("failed to bind HTTP server to port 3000");
         println!("HTTP server listening on http://0.0.0.0:3000");
-        axum::serve(listener, router)
-            .await
-            .expect("HTTP server error");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),  // ← changed
+        )
+        .await
+        .expect("HTTP server error");
     }));
 
     let alert_eval_interval = config.intervals.mqtt_scrape_secs;

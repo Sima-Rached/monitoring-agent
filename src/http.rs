@@ -6,12 +6,17 @@ use axum::{
     routing::{delete, get, post, patch},
     Json, Router,
 };
+use std::net::SocketAddr;
+use tower_governor::{
+    governor::GovernorConfigBuilder,
+    GovernorLayer,
+};
 use chrono::Utc;
 use serde::Serialize;
 use std::sync::Arc;
 use dashmap::DashMap;
 use influxdb2::Client as InfluxClient;
-
+use axum::response::IntoResponse;
 
 use crate::config::{BrokerConfig, RulesConfig};
 use crate::registry::{self, BrokerRuntime};
@@ -336,6 +341,8 @@ pub struct AppState {
     pub influx_client: Arc<InfluxClient>,   
     pub influx_bucket: String,
     pub api_key: String,
+    pub rate_limit_per_second: u64,   // replenish rate
+    pub rate_limit_burst: u32,        //  max burst above the steady rate
 }
 
 // ── GET /metrics ──────────────────────────────────────────────────────────────
@@ -544,6 +551,14 @@ pub async fn require_api_key(
 // ── Router factory ────────────────────────────────────────────────────────────
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let governor_config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(state.rate_limit_per_second)
+            .burst_size(state.rate_limit_burst)
+            .use_headers()
+            .finish()
+            .expect("invalid rate limiter configuration"),
+    );
     // Internal routes — no auth required.
     let internal = Router::new()
         .route("/metrics", get(get_metrics))
@@ -554,13 +569,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/reload", post(post_reload));
 
     // Versioned external API — API key required on every request.
+    //   1. GovernorLayer  — rate limit per peer IP (outermost, runs first)
+    //   2. require_api_key — auth check (runs after quota is consumed)
+    // This order means a hammering client burns quota regardless of key
+    // validity — rate limiting cannot be used to probe whether a key exists.
     let api_v1 = Router::new()
         .route("/metrics", get(get_api_v1_metrics))
         .route("/metrics/history", get(get_api_v1_metrics_history))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
-        ));
+        ))
+        .route_layer(GovernorLayer {
+            config: governor_config,
+        });
 
     Router::new()
         .merge(internal)

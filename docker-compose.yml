@@ -35,7 +35,7 @@ services:
       - influxdb-data:/var/lib/influxdb2
 
   agent:
-    image: simarached/progressbox-agent:1.1
+    image: simarached/progressbox-agent:1.2
     container_name: progressbox-agent
     network_mode: host
     ports:
@@ -45,6 +45,8 @@ services:
       - SMTP_PASSWORD=${SMTP_PASSWORD:?SMTP_PASSWORD must be set}
       - AGENT_HOSTNAME=${AGENT_HOSTNAME:-} 
       - API_KEY=${API_KEY:?API_KEY must be set}
+      - RATE_LIMIT_PER_SECOND=${RATE_LIMIT_PER_SECOND:-10}   
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-20}
     volumes:
       - ./config.toml:/app/config.toml:ro
       - ./rules.toml:/app/rules.toml:ro
