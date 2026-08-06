@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, patch},
     Json, Router,
 };
 use chrono::Utc;
@@ -45,6 +45,37 @@ pub async fn get_alerts(
 
     let count = alerts.len();
     Json(AlertsEnvelope { alerts, count })
+}
+// ── PATCH /alerts/:id/acknowledge ────────────────────────────────────────────
+// Flips acknowledged = true for the given alert id.
+// Idempotent — re-acknowledging an already-acknowledged alert returns 200.
+// Returns 404 if no alert with that id exists.
+
+#[derive(Serialize)]
+pub struct AckResponse {
+    pub id: u64,
+    pub acknowledged: bool,
+}
+
+pub async fn patch_alert_acknowledge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut store = state.alerts.lock().unwrap();
+
+    match store.iter_mut().find(|a| a.id == id) {
+        Some(alert) => {
+            alert.acknowledged = true;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "id": alert.id, "acknowledged": alert.acknowledged })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no alert with id {}", id) })),
+        ),
+    }
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -266,6 +297,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/brokers", get(get_brokers).post(post_broker))
         .route("/brokers/:id", delete(delete_broker))
         .route("/alerts", get(get_alerts))
+        .route("/alerts/:id/acknowledge", patch(patch_alert_acknowledge)) 
         .route("/reload", post(post_reload))
         .with_state(state)
 }

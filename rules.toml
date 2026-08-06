@@ -27,5 +27,5 @@ cooldown_secs = 30
 [[alert_rules]]
 metric = "clients_connected"
 operator = ">"
-threshold = 1000.0
+threshold = 500.0
 cooldown_secs = 60
