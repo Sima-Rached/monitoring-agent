@@ -6,7 +6,6 @@ use axum::{
     routing::{delete, get, post, patch},
     Json, Router,
 };
-use std::net::SocketAddr;
 use tower_governor::{
     governor::GovernorConfigBuilder,
     GovernorLayer,
@@ -559,13 +558,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             .finish()
             .expect("invalid rate limiter configuration"),
     );
+
+    // Spawn background task to clean up expired rate limit entries.
+    // Without this the limiter's internal map grows unbounded.
+    let limiter = governor_config.limiter().clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            limiter.retain_recent();
+        }
+    });
+
     // Internal routes — no auth required.
     let internal = Router::new()
         .route("/metrics", get(get_metrics))
         .route("/brokers", get(get_brokers).post(post_broker))
-        .route("/brokers/:id", delete(delete_broker))
+        .route("/brokers/{id}", delete(delete_broker))
         .route("/alerts", get(get_alerts))
-        .route("/alerts/:id/acknowledge", patch(patch_alert_acknowledge))
+        .route("/alerts/{id}/acknowledge", patch(patch_alert_acknowledge))
         .route("/reload", post(post_reload));
 
     // Versioned external API — API key required on every request.
@@ -580,12 +590,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_api_key,
         ))
-        .route_layer(GovernorLayer {
-            config: governor_config,
-        });
+        .layer(GovernorLayer::new(governor_config));  
 
     Router::new()
         .merge(internal)
         .nest("/api/v1", api_v1)
         .with_state(state)
 }
+

@@ -21,6 +21,7 @@ use crate::registry::BrokerRuntime;
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok(); 
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
     let config = match Config::load(&config_path) {
         Ok(c) => c,

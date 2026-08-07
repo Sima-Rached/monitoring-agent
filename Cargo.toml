@@ -8,7 +8,7 @@ tokio = { version = "1", features = ["full"] }
 rumqttc = "0.24"
 bollard = "0.17"
 influxdb2 = "0.5"
-axum = "0.7"
+axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
@@ -21,4 +21,6 @@ serde_json = "1"
 hostname = "0.3"
 influxdb2-structmap = "0.2.0"
 num-traits = "0.2"
-tower-governor = { version = "0.8", features = ["axum"] }
+tower = "0.5.3"
+tower_governor = { version = "0.8", features = ["axum"] }
+dotenvy = "0.15"
